@@ -273,7 +273,7 @@ The domains are 0.4's:
 
 | Piece | Domain | Why |
 | --- | --- | --- |
-| Device key | HQ signer (Secure Enclave or TPM, HQ account only) | Non-exportable. Revoking the device needs no key rotation. |
+| Device key | HQ signer (Secure Enclave or TPM, HQ account only) | Non-exportable. Revoking the device needs no key rotation. A software key is a stage 0–1 transition only, and the identity service may refuse to mint for it per policy (§4.7). |
 | Enrollment | HQ, plus the owner confirming on the identity service | One-time, owner-confirmed challenge (0.4 §3). |
 | GitHub App keys and other service identities | Identity service | 0.4 §4, §12 |
 | Minting, issuance records | Identity service | Bound to the device and the grant. Each issuance is recorded. |
@@ -282,7 +282,7 @@ The domains are 0.4's:
 | Approval records | HQ, signed, from the owner session | 0.4 §8: bound to the digest of the proposed action. |
 | Soul ID, member, runtime and installation records; receipts | HQ store | R1 |
 | gh shim, credential helper, git hooks | Soul, **cooperative profile only** | In the protected profile members hold no service token, and service writes go through the broker's adapter. |
-| Vouch / soul-token key (today `vouch-key.pem`) | HQ store or signer | Out of members' reach. |
+| Vouch / soul-token key (today `vouch-key.pem`) | **HQ signer only**, non-exportable | No long-lived signing key as a file on the host. Secure Enclave and most TPMs hold P-256 rather than Ed25519, so soul tokens move to a `v2` signed with ES256. The agent-comms broker verifies `v2` and accepts `v1` (Ed25519) only during the transition window. If a host has no hardware signer, the identity service signs soul tokens instead, and HQ asks for them like any other credential. |
 
 #### Comms
 
@@ -311,7 +311,7 @@ The domains are 0.4's:
 | --- | --- | --- |
 | Managed protected | HQ in its own account. Per-member principals. Broker-only protected egress. Caller-bound grants. Durable receipts. | The Linux reference host first; macOS per-member accounts plus a sandbox second. |
 | Managed cooperative | HQ protects keys, but members share a trust domain or have bypass routes | Today's layout, and macOS until it qualifies. Confinement, gh shim and git hooks are cooperative controls. |
-| Standalone unenforced | Local stub and local credentials | Development; `legacy-local-custody`. |
+| Standalone unenforced | Local stub and local credentials | Development only. `legacy-local-custody` is **off by default** and can be turned on only in this profile. `doctor` and `status` flag it, and every receipt names it. |
 
 Every receipt and the GeniusBar header name the profile actually in force.
 A protected claim under a weaker profile is refused with
@@ -380,7 +380,7 @@ invoke a plugin (R2).
 | --- | --- | --- |
 | `config` | `get`, `section`: read-only, schema-validated, no secrets | `~/.config/agent-bot/config.json` (HQ account), the plugin's section |
 | `store` | `tx(fn)` with plugin-scoped tables, `blob`, `lock` | A transactional embedded database in HQ's account (0.4 §12). Authority tables are separate from mirrors of member-writable state. The plugin `name` is validated before any path is built. |
-| `credentials` | `resolve(reference, { task, operation }) → token` (HQ memory only), `issue(reference)` for Equip | Asks the identity service for a token bound to the device key and the grant. **A plaintext secret never reaches a member.** If the service is down, the result is `credential_unavailable` (R9). |
+| `credentials` | `resolve(reference, { task, operation }) → token` (HQ memory only, one operation), `issue(reference)` for Equip | Asks the identity service for a token bound to the device key, the grant, the task and the operation, and never reuses it across operations (§4.7). **A plaintext secret never reaches a member.** If the service is down, the result is `credential_unavailable` (R9); if the device is revoked, `device_revoked`. |
 | `identityService` | `call(method, route, body)` | Limited to the allowlist. Hardened per §4.7. |
 | `approvals` | `request({ action, digest, scope, reason, cost, expiry })`, `decided(id)` | Produces an HQ-signed approval record from an owner session (0.4 §8). Editing the action invalidates it (T24). |
 | `launch` | `member({ soul, role, principal, home, env })`, `track`, `stop` | Per-member principals and private `HOME`/`XDG_*`/`PATH`/temp inside the member's state (0.4 §4). |
@@ -409,11 +409,13 @@ discover → resolve → load → init (topological order) → start (topologica
 1. **HQ core:** store, control socket (owner sessions), profile detection,
    signer discovery.
 2. **identity `init`:** device status from the signer.
-   - **Unenrolled or revoked** → **safe mode**: only `status`, `enroll` and
-     `doctor` work, and no Soul is admitted.
-   - **Identity service unreachable** → *not* safe mode. Admission proceeds,
-     and only protected effects that need a fresh credential wait with
-     `credential_unavailable` (R9).
+   - **Unenrolled** (no device record) → **safe mode**: only `status`,
+     `enroll` and `doctor` work, and no Soul is admitted.
+   - **Revoked** → the **`device_revoked`** state, which is distinct from
+     safe mode and defined in §4.7.
+   - **Identity service unreachable** → neither of the above. Admission
+     proceeds, and only protected effects that need a fresh credential wait
+     with `credential_unavailable` (R9).
 3. **identity `start`:** identity-service link (assertion, token, key-set
    check per §4.7), grants, credential references.
 4. **comms:** broker (requires identity). It drains identity-service notices
@@ -488,6 +490,39 @@ These rules apply to every call from HQ to the identity service.
 - **Outage.** Tokens already minted are used until expiry and never after.
   An outage widens no authority and gives no component an execution
   channel (0.4 §6).
+- **One token per task and operation.** HQ asks for a credential with
+  `{ task, operation }`. The identity service records both in the credential
+  issuance record, extending 0.4 Appendix A's fields with `task_id` and
+  `operation_id`. HQ never reuses a token for another operation: a token is
+  held in memory for that operation only and dropped when its action record
+  reaches a terminal state. The cost is one mint per protected operation,
+  bounded by a per-device rate limit at the identity service.
+- **Software device keys.** Until stage 2a a host may still enroll with a
+  software key (`key_storage=software`). The identity service can refuse to
+  mint for software-key devices **per owner policy**. Once that policy is on,
+  those mints are refused with `profile_insufficient`, and the receipt
+  names the device's key storage. The device itself is not revoked.
+- **`device_revoked`.** When the identity service answers that the device is
+  revoked (today `invalid_grant` on `/oauth/token`, or an explicit revoked
+  status on any call), HQ maps it to `device_revoked` and does the
+  following:
+  - it **drops every cached token and resolved credential immediately**,
+    without waiting for expiry;
+  - it refuses every new credential resolution and every protected external
+    effect not yet submitted with `device_revoked`;
+  - it moves effects already submitted to reconciliation, as for any
+    uncertain outcome;
+  - it records a receipt and shows "device revoked: re-enroll" in `status`,
+    GeniusBar and the HQ CLI.
+
+  Members see `device_revoked` as the result of their query or task step,
+  and the affected tasks wait with reason `credential unavailable` and that
+  code. Local conversations, local tasks and operations that need no
+  credential continue, so HQ does *not* enter safe mode. Recovery requires a
+  **new enrollment** (`enroll --force`) with a fresh device key. The revoked
+  device record is never revived. This differs from safe mode's
+  "unenrolled" (never enrolled: no Soul admitted) and from
+  `credential_unavailable` (transient: retried when the service returns).
 
 ### 4.8 Relays, notices and wake
 
@@ -725,10 +760,10 @@ releases.
 | --- | --- | --- |
 | MCP `take_inbox`, `POST /v0/inbox/take`, `gh-inbox-query`, `inbox-probe` | Broker-pulled notices (§4.8) and a member query `notices.peek` | Two releases after notices ship |
 | `gh-app-hook` Worker, `wrangler.toml`, `INBOX_TOKEN`, `WEBHOOK_SECRETS`, `SUBSCRIBERS` | Identity-service webhooks and notices | After a dual-run window |
-| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | 1.0 (until then behind `legacy-local-custody`, standalone profile) |
-| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | 1.0 |
-| `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | HQ store or signer; brokered service adapter | Stage 2b |
-| `device-key.pem` (software) | HQ signer hardware key, after re-enrollment | Stage 2a |
+| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Off by default from PR 18, opt-in only under the standalone profile and flagged by `doctor`/`status`. **Code removed in the HQ release that closes stage 3, proposed no later than 2027-01-31** (planning estimate from 0.4 §13's ranges; the owner confirms the date). |
+| `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Same switch and the same dated removal as local App key custody |
+| `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | HQ signer only (soul token `v2`, ES256), or identity-service signing where no hardware signer exists; brokered service adapter | Stage 2a for the key; stage 2b for the tools |
+| `device-key.pem` (software) | HQ signer hardware key, after re-enrollment. Until then the identity service may refuse software-key devices per policy. | Stage 2a |
 | Owner gate through keyd Touch ID or the admin dialog in an agent account; agent-comms principal credential checks for revisions | HQ approval records from the owner session | Stage 3 |
 | One daemon per agent account | One HQ per host in its own account (strangler; the old daemon is retired when HQ passes the same contract and recovery tests) | Stage 3 |
 | `soul.json` format 1/2 packages | `contents-1` layout (§5.4) | One major after migration ships |
@@ -768,15 +803,15 @@ bot-signed commits) and uses `Refs #N` for partial work.
 
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
-| 15 | identity | WP2 | **HQ signer:** device key in TPM (Linux) or Secure Enclave (macOS) under the HQ account; vouch key into HQ's store; re-enrollment path | `key_storage=hardware`; T02 |
+| 15 | identity | WP2 | **HQ signer:** device key in TPM (Linux) or Secure Enclave (macOS) under the HQ account; soul-token key in the signer (`v2`, ES256), with `vouch-key.pem` removed; re-enrollment path | `key_storage=hardware`; no signing key file on the host; the agent-comms broker verifies soul token `v2`; T02 |
 | 16 | daemon | WP2 | **Linux protected profile:** per-member service identities, namespaces, broker socket and workspace views as the only exits, caller-bound grant handles | T01–T03, T21 |
 
 ### Stage 2b: brokered adapters (WP2, WP4)
 
 | # | Repo | WP | PR | Done when |
 | --- | --- | --- | --- | --- |
-| 17 | server | WP2 | **Identity service:** grant-bound minting, credential issuance records, live tokens revoked on device revoke, hardware attestation, device self-revoke, owner-unlock vault | Documented in the server API docs |
-| 18 | identity | WP2 | **Credential references resolved by HQ;** local custody behind `legacy-local-custody`; `doctor` flags any key file | No long-lived secret on a fresh host |
+| 17 | server | WP2 | **Identity service:** grant-bound minting per task and operation, credential issuance records with `task_id` and `operation_id`, live tokens revoked on device revoke and `device_revoked` on every call afterwards, hardware attestation, an owner policy to refuse software-key devices, device self-revoke, owner-unlock vault | Documented in the server API docs; revocation test shows cached tokens dropped and `device_revoked` |
+| 18 | identity | WP2 | **Credential references resolved by HQ;** `legacy-local-custody` off by default and opt-in only under the standalone profile; `doctor` and `status` flag it and any key file | No long-lived secret on a fresh host |
 | 19 | comms | WP4 | **Brokered inference and service adapter** (GitHub), action ledger with reconciliation, budgets and sub-allocations | T06–T11, T17–T19, T23, T25, T26 |
 | 20 | identity | WP4 | **Retire gh-app-hook** | `doctor` has no `inbox.*` checks |
 
@@ -1032,7 +1067,7 @@ Columns: **Now** is the ADR-0645 module; **Target** is the destination; **Domain
 | `identity/soul-credentials.mjs` | 553 | identity | identity service | identity service | fs, exec, keyd, os-secret, key-material | 9/7 | `identity/agent-identity` `identity/owner-gate` `soul-app-declarations` `identity/mint-token` | C1 | HQ gets credential references resolved to short-lived tokens instead. |
 | `identity/soul-genesis.mjs` | 33 | identity | identity | HQ | - | 2/1 | - |  |  |
 | `identity/uninstalled-identity-hook.mjs` | 900 | identity | identity | Soul | fs, exec | 2/1 | - |  |  |
-| `identity/vouch.mjs` | 318 | identity | identity | HQ | fs, comms, key-material | 1/5 | - |  | Signing key moves into the HQ store/signer. |
+| `identity/vouch.mjs` | 318 | identity | identity | HQ | fs, comms, key-material | 1/5 | - |  | Signing key moves into the HQ signer (non-exportable; soul token `v2`, ES256). |
 | `identity/worktree-token.mjs` | 207 | identity | identity | Soul | fs, exec, worktree | 7/0 | - |  |  |
 | `install.mjs` | 512 | cli | daemon | owner client | fs, exec, worktree | 7/3 | `spaces-cutover` `sandbox` |  |  |
 | `keyd-supervisor.mjs` | 116 | host | identity | HQ | fs, exec, keyd, os-secret | 2/0 | `daemon-supervisor` |  | Supervises the HQ signer. |
