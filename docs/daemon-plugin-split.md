@@ -760,7 +760,7 @@ releases.
 | --- | --- | --- |
 | MCP `take_inbox`, `POST /v0/inbox/take`, `gh-inbox-query`, `inbox-probe` | Broker-pulled notices (§4.8) and a member query `notices.peek` | Two releases after notices ship |
 | `gh-app-hook` Worker, `wrangler.toml`, `INBOX_TOKEN`, `WEBHOOK_SECRETS`, `SUBSCRIBERS` | Identity-service webhooks and notices | After a dual-run window |
-| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Off by default from PR 18, opt-in only under the standalone profile and flagged by `doctor`/`status`. **Code removed in the HQ release that closes stage 3, proposed no later than 2027-01-31** (planning estimate from 0.4 §13's ranges; the owner confirms the date). |
+| Local App key custody: `ensure-private-key`, `identity-app-store`, `soul-credentials`, `credential-reconciler`, keyd App items, `migrate-credentials` | Identity service; HQ credential references | Off by default from PR 18, opt-in only under the standalone profile and flagged by `doctor`/`status`. **Code removed at stage 3 exit or on 2027-01-31, whichever comes first** (decided 2026-10-27, §10.1). The opt-in stops working on that date. |
 | `secret*.mjs`, Proton Pass providers, `soul secret set` | Identity-service vault (owner-unlock); HQ credential references | Same switch and the same dated removal as local App key custody |
 | `vouch-key.pem`, `/v0/keyd/grant`, keyd `credential`/`git_credential` tools | HQ signer only (soul token `v2`, ES256), or identity-service signing where no hardware signer exists; brokered service adapter | Stage 2a for the key; stage 2b for the tools |
 | `device-key.pem` (software) | HQ signer hardware key, after re-enrollment. Until then the identity service may refuse software-key devices per policy. | Stage 2a |
@@ -841,36 +841,43 @@ federation.
 
 ## 10. Decisions, open questions, risks
 
-### 10.1 Top three decisions for Chris
+### 10.1 Decisions (recorded 2026-10-27)
 
-- **D1. agent-bot-daemon is HQ.** 0.4 Appendix C says the HQ role is
-  absorbed into managed-machine. This plan puts HQ in agent-bot-daemon,
-  which grows out of today's agent-bot daemon, and keeps managed-machine as
-  the provisioner (it creates HQ's account and the member accounts).
-  Accepting this also means three other updates:
-  - 0.4's component table changes;
-  - ADR-0645's `qwts/agent-identity` extraction is superseded;
-  - ENG-0128 is amended.
+Chris decided these on 2026-10-27, after PR #2 merged (issue #1).
 
-  *Recommended: yes.*
-- **D2. Provider credentials that can't be short-lived.** 0.4 says a
-  long-lived secret never goes on the host, and that inference is brokered
-  by HQ. The pilot's primary provider uses static API keys. The options:
-  - **(a)** the identity service brokers or issues per-task inference
-    credentials;
-  - **(b)** use only providers with federated short-lived credentials (such
-    as the Bedrock fallback route) for protected work;
-  - **(c)** for the pilot, resolve the key into HQ memory only (never
-    members, never disk). This is a declared exception named in every
-    receipt.
+- **D1. agent-bot-daemon is HQ. Accepted.** managed-machine stays the
+  provisioner: it creates HQ's account and the member accounts. The
+  follow-ups are:
+  - **0.4's component table and Appendix C:** updated by Grok in the draft
+    0.4.1 source;
+  - **ADR-0645's `qwts/agent-identity` extraction:** retired by ADR-1183
+    (qwts/agent-bot-identity#1194);
+  - **ENG-0128:** its extraction amendment is replaced by ENG-0111
+    (qwts/qwts-agent-sop#112). ENG-0128 was at its docs-gov token budget,
+    so the change is a new record rather than another amendment.
+- **D2. Provider credentials that can't be short-lived: (c) for the pilot,
+  (a) as the target.** The pilot key:
+  - is resolved from the identity service when HQ starts, never from a config
+    file;
+  - is held in HQ memory only, never on disk;
+  - is named as an exception on every receipt;
+  - is capped and rotated on the provider side.
 
-  *Recommended: (c) for the pilot, with (a) as the target.* It needs a line
-  in 0.4.
-- **D3. Hosted Souls are outside 0.4.** The brief asks for soul-runtime to
-  run identically on the server for unmanaged agents. 0.4's MVP is one
-  owner on one host, with hosted service gated on tenancy and operations
-  work (§15). *Recommended:* keep the pure core and ports (§6) so it stays
-  possible, with no server-runtime PRs before the pilot gates.
+  The target is per-task inference credentials, or the identity service
+  acting as an inference gateway, so the key never reaches a host. **Q1
+  (2026-10-27, "pick the best"):** for the pilot, the key is injected into
+  the harness process environment for the soul's declared provider only.
+  A loopback inference proxy (qwts/agent-bot-identity#1190) ends that. It
+  must land before any `managed protected` claim, or at stage 3 exit,
+  whichever comes first. Shipped in qwts/agent-bot-identity#1188.
+- **D3. Hosted Souls: accepted as recommended.** soul-runtime's core stays
+  pure, and there is no server-runtime work before the pilot gates. Hosted
+  Souls remain the plan for hosts that can't run a daemon, so nothing may be
+  designed that rules them out.
+- **`legacy-local-custody`: removed at stage 3 exit or on 2027-01-31,
+  whichever comes first.** It is off by default until then. It shipped off
+  by default, with the date enforced in code, in
+  qwts/agent-bot-identity#1185.
 
 ### 10.2 Open questions
 
