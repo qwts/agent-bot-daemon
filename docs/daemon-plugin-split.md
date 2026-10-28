@@ -26,15 +26,21 @@ and no refactor commits come with it.
   provider secrets all sit on the agent's machine. They move behind the gate
   (the agent-bot server, or a local signer the agent can't read). After that
   the local owner gate and confinement are cooperative UX, not security.
-- soul-runtime becomes a pure core with five adapters (storage, secrets,
-  exec, comms, clock). The daemon implements them with the filesystem,
-  worktrees and the signer, and the server implements them with encrypted
-  per-user storage, a vault and a sandbox. One conformance suite runs against
-  both.
-- The migration is about 25 small PRs. The first ten are in place in
-  `agent-bot-identity` and need no new repository. The `agent-bot` CLI and
-  every MCP tool keep working throughout. `take_inbox` and `gh-app-hook` give
-  way to the server's notices.
+- soul-runtime becomes a pure core behind nine ports: storage, secrets,
+  exec, comms, identity, approvals, clock, random and log. The daemon
+  implements them with the filesystem, worktrees and the signer, and the
+  server implements them with encrypted per-user storage, a vault and a
+  sandbox. One conformance suite covers every port on both.
+- The daemon never accepts inbound connections from the network. It dials
+  out: HTTPS to the server for requests, and one WebSocket to a relay
+  (a Cloudflare Durable Object per device at `relay.true-line.ai`) for
+  server → daemon events and RPC. When the socket is down it drains the
+  notices queue (take/ack) instead (§4.8).
+- The migration is 27 small PRs. Phase 1 (11 PRs) happens in place in
+  `agent-bot-identity`, plus the SDK and the relay design, and needs no new
+  repository. The `agent-bot` CLI and every MCP tool keep working
+  throughout. `take_inbox` and `gh-app-hook` give way to the server's
+  notices.
 
 ## 1. Where we start
 
@@ -178,16 +184,17 @@ census. Both are handled by the rule in §3.3: plugins never import plugins.
 ## 3. Target architecture
 
 ```text
-                     ┌──────────────── gate ────────────────┐
-                     │ agent-bot server (Go, Vercel)         │
-                     │  device registry · policy · approvals │
-                     │  App keys · installation tokens       │
-                     │  vault · notices · relay/RPC          │
-                     │  encrypted soul storage               │
-                     │  soul-runtime (Node) + sandbox        │  ← unmanaged souls
-                     └───────▲──────────────────────────────┘
-                 DPoP + signed responses (TLS)
-┌───────────────────────────┴─────────────── agent machine (untrusted) ──────┐
+         ┌──────────────────────────── gate ─────────────────────────────┐
+         │ agent-bot server (Go) · agents.true-line.ai                    │
+         │   device registry · policy · approvals · App keys              │
+         │   installation tokens · vault · notices queue                  │
+         │   encrypted soul storage · soul-runtime (Node) + sandbox       │ ← unmanaged souls
+         │ relay · relay.true-line.ai (Cloudflare Worker, 1 DO per device)│
+         └────────▲───────────────────────────────▲──────────────────────┘
+     HTTPS requests: DPoP proof,          WSS, outbound only: DPoP on connect,
+     signed responses                     signed server→daemon frames (§4.8)
+          (daemon dials)                       (daemon dials)
+┌─────────────┴───────────────────────────────┴ agent machine (untrusted) ────┐
 │ agent-bot-daemon (host)                                                     │
 │   core: config · storage · log/audit · exec · server link · local API       │
 │   plugins (in process, topological order):                                  │
@@ -233,9 +240,10 @@ matters.
 | --- | --- | --- |
 | Plugin host, local API, CLI, MCP surfaces, hook runner | agent | Agents execute through them. They hold no long-lived secret. |
 | DPoP ephemeral key and 15-minute access token | agent (memory only) | Short-lived and bound to the device. Today's `server-client` already keeps the ephemeral key off disk. |
-| Pinned server response key | agent | Public. Integrity comes from TOFU plus a fingerprint shipped in the signed release, checked out of band. |
+| Server response and frame keys | agent | Public. The primary trust anchor is the key set shipped in the signed daemon release (`server-keys.json`, by `kid`). TOFU is allowed only for a non-default server named explicitly in config, and `status` reports it. Rotation is in §4.7. |
 | Policy: which repo, scopes, rate limits, approvals | gate | The agent may request but never grant itself access. |
-| Relay/RPC broker between daemons, UI and server | gate | Routing across machines needs an authority the agent can't impersonate. |
+| Relay (`relay.true-line.ai`, one Durable Object per device) | gate | Carries server → daemon events and RPC over a socket the daemon dials. Design in §4.8. |
+| Network listeners | none | The daemon accepts no inbound network connections. Local IPC is peer-checked (§7.1). The browser PWA's `127.0.0.1` listener is the one exception, and the legacy loopback `/v0`/`/v1` API stays only for the compatibility window. |
 | Audit receipts | agent copy plus gate copy | The local copy can be tampered with, so the gate copy is authoritative. |
 
 #### Identity
@@ -272,10 +280,23 @@ matters.
 | --- | --- | --- |
 | Core logic | both | Pure, and identical on both. |
 | Definition and life storage | agent (cache) plus gate (canonical, encrypted per user) | Losing the machine must not lose the soul. |
-| Provider secrets (model API keys, `credentials.secrets`) | **gate** vault, leased | Long-lived. See decision D1 for keys that can't be short-lived. |
+| Provider secrets (model API keys, `credentials.secrets`) | **gate** vault, leased | Long-lived. A lease puts the value in plaintext in a process running as the agent's user (see the note below and D1). |
 | Runtime installs | agent | Verified by the catalog digest, which ships in the signed release. |
 | Revision approvals, capability grants (computer-use, autopilot) | gate | They are policy. |
 | Exec, worktrees, harness processes | agent (daemon) / gate sandbox (server) | |
+
+**Accepted trade-off: leased secrets are readable by the agent.** A value
+returned by `services.secrets.lease` is plaintext inside the daemon, which
+runs as the agent's user. Any soul in that account can read it through the
+same UID, `/proc`, a debugger or a core dump. Under D1(b) this is accepted
+deliberately: leases are scoped to (soul, name, purpose), short, never
+persisted, and revoked when the device is revoked. The plan prefers patterns
+where the value never reaches the machine:
+
+- a server-side LLM gateway that holds the provider key and issues
+  per-session tokens (D1(a));
+- server-side commits through the Git Data API (Q4);
+- running a soul that needs a non-leasable key only on the server (D1(c)).
 
 ### 3.3 Rules that keep the split honest
 
@@ -328,6 +349,7 @@ It runs no plugin code until the set has resolved.
 | Events | `ctx.events.publish(type, payload)` / `subscribe(type, fn)` | `type` is `<plugin>.<noun>.<verb>`, e.g. `comms.wake.requested` | In process, at most once. Anything durable goes through storage. Payload schemas are versioned with `schemaVersion`. |
 | Harness hooks | `ctx.hooks.register(hook)` | `{ event: 'session-start'\|'pre-tool-use'\|…, run }` | Wired by the hook runner (`agent-hook.mjs` today). |
 | Readiness probes | `ctx.readiness.register(probe)` | `{ id, run }` | Splits `readiness.mjs` (3.1k lines). |
+| RPC handlers | `ctx.rpc.register(handler)` | `{ method: '<plugin>.<verb>', schema, deadlineMs, handler }` | Called by the server over the relay (§4.8). Device policy at the gate decides which methods the server may call. |
 | Provided services | `return { provides: { identity: {...} } }` | a plain object of functions | Dependents receive it as `ctx.deps['agent-bot-identity'].identity`. |
 
 ### 4.3 Host services (what a plugin gets)
@@ -335,10 +357,10 @@ It runs no plugin code until the set has resolved.
 | Service | Interface (abridged) | Daemon implementation |
 | --- | --- | --- |
 | `config` | `get(key)`, `section()`: read-only, schema-validated, no secrets | `~/.config/agent-bot/config.json`, the plugin's section only |
-| `storage` | `kv.get/put/cas`, `blob.read/write`, `log.append/scan`, `lock(name)` | `<state>/plugins/<name>/`, 0700, atomic rename, `file-lock` |
-| `secrets` | `lease(name, { scope, purpose }) → { value, expiresAt }`. No `put`. | Fetched from the gate vault through the server link and kept in memory until TTL. Never persisted. |
+| `storage` | `kv.get/put/cas`, `blob.read/write`, `log.append/scan`, `lock(name)` | `<state>/plugins/<name>/`, 0700, atomic rename, `file-lock`. `name` must match `^[a-z0-9-]{1,64}$` at discover, and the resolved path must stay under `<state>/plugins/`, so a plugin name can't traverse. Keys and blob names are validated the same way. |
+| `secrets` | `lease(name, { scope, purpose }) → { value, expiresAt }`. No `put`. | Fetched from the gate vault through the server link and kept in memory until TTL. Never persisted. The value is plaintext in an agent-UID process: an accepted trade-off under D1(b), see §3.2. |
 | `log` / `audit` | `log.info/warn/error(obj)` (redacted), `audit.append(receipt)` | `daemon-log`, `diagnostic-redact`, `audit.jsonl`, forwarded to the gate |
-| `server` | `call(method, route, body)`, `subscribe(channel)` | DPoP plus response-signature verification. Calls are limited to the plugin's `serverRoutes`. |
+| `server` | `call(method, route, body)`, `subscribe(channel)` | Calls are limited to the plugin's `serverRoutes`. Every fetch uses `redirect: 'error'` and a DPoP proof bound to the token's `jkt`. Every response must carry a valid signature under a release-pinned key; unsigned, mismatched or stale responses are refused. §4.7 has the full rules. |
 | `exec` | `run({argv, cwd, env, timeoutMs})`, `spawn(…)`, `track(pid)` | `child-env` (minimal env), `process-ownership`, Windows job objects |
 | `approvals` | `request({ action, digest, scope }) → { id, status }`, `await(id)` | Asks the gate. Local presence is used only when `scope: 'local'`. |
 | `events`, `clock`, `random`, `jobs`, `ui` | as named | `ui.push(event)` feeds the UI event stream. |
@@ -349,11 +371,15 @@ It runs no plugin code until the set has resolved.
 discover → resolve → load → init (topological order) → start (topological order) → running → stop (reverse order, deadline)
 ```
 
-- **discover** reads `plugin.json` only.
+- **discover** reads `plugin.json` only, validates `name`, and hashes the
+  plugin's file tree against `governance/plugins.json` in the installed
+  release (§4.5).
 - **resolve** checks semver and `hostApi`, then requires an acyclic `requires`
   graph and refuses the set otherwise.
-- `init` must be idempotent and side-effect free apart from registering. It
-  times out at 10 s.
+- `init` must be idempotent. Apart from registering, it may run read-only
+  probes (identity asks the signer for device status, for example). It must
+  not write state, call the server or start long-lived work. It times out at
+  10 s.
 - `stop` gets a deadline. On timeout the host unregisters the plugin and logs.
 
 **Bootstrap, with identity first and hard-required:**
@@ -364,8 +390,8 @@ discover → resolve → load → init (topological order) → start (topologica
    revoked → **safe mode**, where only `status`, `identity enroll` and
    `doctor` work. The server link stays down and no other plugin starts.
 3. **Server link `start`:** uses `identity.device.signAssertion` for
-   `/oauth/token`, verifies the pinned key, then connects relay/RPC once the
-   server offers it.
+   `/oauth/token`, checks the server's key set against the release pins, then
+   opens the relay socket (§4.8) and drains any queued notices.
 4. **identity `start`:** binding registry, server minting, soul tokens.
 5. **comms:** `init` then `start` (requires identity).
 6. **soul-runtime:** `init` then `start` (requires identity, comms
@@ -389,6 +415,15 @@ dependents don't start, and the rest keep running.
   `governance/plugins.json` (`name`, `version`, `sha256`). CI refuses a tree
   that doesn't match the pins. Pins never move backwards, the same rule as
   the extraction plan's §6.
+- **The host checks the pins at load as well as in CI.** At discover it
+  hashes each plugin's installed file tree (sorted paths, normalised modes,
+  the same netstring framing as soul revisions) and compares it with the
+  release's `sha256`. A mismatch refuses that plugin and writes an audit
+  receipt, and `status` names the plugin and both digests. A mismatch on
+  identity puts the daemon in safe mode. A developer override exists only as
+  an explicit `--dev-plugins PATH` flag, and `status` always reports it.
+  This catches accidental edits; it can't stop a same-user attacker who can
+  also edit the host, which is why authority lives at the gate.
 
 ### 4.6 Usable on its own for testing
 
@@ -403,6 +438,176 @@ bindings. Each plugin repo runs:
   deadline, that there is no global state, that nothing is written outside
   `storage`, that tool, command and route names are unique, and that every
   route has an `auth` class.
+
+### 4.7 Server link hardening
+
+These rules are mandatory for every server call, from the daemon or from
+any plugin through `services.server`. `identity/server-client.mjs` already
+does the first two; the rest are new.
+
+- **No redirects.** Every fetch is made with `redirect: 'error'`. A 3xx could
+  forward device assertions or DPoP proofs to another origin.
+- **DPoP on every request.** The proof carries `htm`, `htu`, `iat`, a fresh
+  `jti`, and `ath` (the hash of the access token). It is signed by the
+  ephemeral key whose thumbprint (`jkt`) the token is bound to through
+  `cnf.jkt`. The server refuses a token presented with a proof from any other
+  key.
+- **Signed responses are required.** Every `/api/daemon/*` response must
+  carry three headers:
+  - `Agent-Bot-Signature`, an Ed25519 signature over
+    `agent-bot-sig-v1\n<status>\n<hex sha256(body)>\n<request jti>`;
+  - `Agent-Bot-Request-Jti`, equal to this request's jti;
+  - `Agent-Bot-Key-Id`, naming a key in the pinned set.
+
+  A response that is unsigned, names an unknown or retired `kid`, fails
+  verification, or echoes a different jti is refused and never parsed. Error
+  responses are verified too.
+- **What "stale" means.** Because the signature covers the request's fresh
+  jti, a recorded response can't be replayed onto a new request. The daemon
+  also refuses a response whose `server_time` (on `whoami`) or `Date`
+  differs from local time by more than 5 minutes, and then reports clock
+  skew instead of retrying silently.
+- **Pinned keys, release first.** The daemon release ships
+  `server-keys.json`, which holds `{ server, keys: [{ kid, x, notBefore,
+  notAfter, status: active|next|retired }] }` for the default server. That
+  set is the trust anchor, and `/.well-known/agent-bot-server-key` is only
+  checked against it. TOFU (today's behaviour) stays only as a fallback for
+  a non-default server named explicitly in config. Its pin is recorded with
+  `source: tofu`, and `status` and `doctor` flag it.
+- **Key rotation.** The server publishes the `next` key in its JWKS at least
+  one daemon release before it signs with it. A daemon release adds the
+  `next` key to `server-keys.json`. At cut-over the server signs with `next`,
+  which then becomes `active`, and the old key is marked `retired` in the
+  following release. A daemon too old to know the new `kid` refuses responses
+  and asks for an update. It never TOFU-pins on a default server. An
+  emergency rotation ships as a daemon patch release.
+
+### 4.8 Two-way comms: outbound-only relay with a notices fallback
+
+The daemon never listens on the network. Server → daemon traffic (events,
+RPC and MCP notifications) arrives over a socket the daemon dials out, and
+falls back to the notices queue when that socket is down. This section
+answers Q8.
+
+#### Topology
+
+- `relay.true-line.ai` is a Cloudflare Worker with **one Durable Object per
+  device**, named by `device_id`. The DO holds the WebSocket using the
+  hibernation API, a small replay buffer, and the connection epoch.
+- The Go server (`agents.true-line.ai`) reaches a device's DO through an
+  internal, authenticated call: a service credential that only the server
+  holds, never the daemon. It uses that call to push events and RPC
+  requests.
+- **Ownership:** the relay is gate code in `true-line/agent-bot`, next to
+  the server, with its design in that repo (PR 11). It isn't part of any
+  plugin repo.
+
+#### Connecting and authenticating
+
+1. The daemon opens
+   `GET wss://relay.true-line.ai/v1/devices/<device_id>/connect` with
+   `Authorization: DPoP <access token>` and a DPoP proof
+   (`htm: GET`, `htu` = the `https://` form of that URL).
+2. The relay validates the token and proof with the server. It checks that
+   the token's `device_id` equals the path's, and that the device isn't
+   revoked. On failure it closes with 4401; for a revoked device, 4403.
+3. **Re-auth on token refresh.** 60 s before the access token expires, the
+   relay sends `{ type: 'reauth-required', exp }`. The daemon mints a new
+   token, as `ServerSession` already does, and sends
+   `{ type: 'auth', token, dpop }` over the socket, with a fresh proof for
+   the connect URL. If no valid `auth` frame arrives before expiry, the
+   relay closes with 4401.
+4. **Revocation.** Revoking a device on the server tells its DO to close the
+   socket immediately (4403) and refuse reconnects.
+
+**Framing.** Frames are JSON text, one object per frame.
+
+```json
+{ "v": 1, "type": "event | rpc.request | rpc.response | ack | auth | reauth-required | resume | ping",
+  "id": "<uuid>", "seq": 42, "epoch": "<connection epoch>", "ts": 1793142600000,
+  "channel": "notices | mcp | soul | comms | control",
+  "durable": true, "idempotencyKey": "<notice id or null>",
+  "payload": { }, "sig": "<base64url Ed25519, server → daemon frames only>" }
+```
+
+- **Signing and replay protection (server → daemon).** `sig` is the
+  server's Ed25519 signature over
+  `agent-bot-frame-v1\n<device_id>\n<epoch>\n<seq>\n<id>\n<hex sha256(canonical JSON of type, channel, durable, idempotencyKey, payload)>`.
+  It is verified against the same release-pinned key set as responses
+  (§4.7). The relay can't forge frames: it routes, and the server signs.
+  The daemon refuses frames that are unsigned, carry a `seq` at or below the
+  last one seen in this epoch, carry an unknown epoch, or are more than
+  5 minutes old.
+- **Daemon → server direction.** The socket carries only `rpc.response`,
+  `ack` (transport-level), `auth`, `resume` and `ping` from the daemon. Each
+  is bound to the authenticated socket, and an `rpc.response` must name an
+  open request `id`. Every state-changing daemon request still goes over
+  HTTPS with its own DPoP proof (§4.7), including the authoritative notice
+  acks.
+- **Events and RPC.**
+  - `event` is one-way. It is `durable: true` when it must not be lost (it
+    is then backed by a notice, see below) and `durable: false` for presence
+    and progress, which are dropped while offline.
+  - `rpc.request` is `{ method, params, deadlineMs }`, addressed to a method
+    a plugin registered with `ctx.rpc.register`. The daemon answers with
+    `rpc.response { id, result | error }`.
+  - RPC is **live-only**: when the socket is down the server gets
+    `device-offline` at once. RPC is never queued, because a late RPC is
+    worse than a refused one.
+- **MCP events.** MCP notifications for a device's sessions (for example
+  `notifications/tools/list_changed`, resource updates, or "notices
+  available") arrive as `event` with `channel: 'mcp'`. The payload is the
+  MCP JSON-RPC notification, verbatim. The comms plugin forwards it to the
+  bound harness's `agent-bot mcp` session. A notification that tells the
+  agent there is work is always also a durable notice, so it survives being
+  offline.
+
+#### Reconnect and backoff
+
+- Exponential backoff with full jitter, from 1 s up to a 60 s cap. It resets
+  after 60 s of stable connection.
+- The daemon reconnects immediately on wake from sleep or a network change.
+- Heartbeat: a `ping` every 25 s; two missed answers mean reconnect.
+- On reconnect the daemon sends `resume { epoch, lastSeq }`. If the DO still
+  has that epoch in its buffer it replays the frames after `lastSeq`.
+  Otherwise it starts a new epoch, and the daemon runs the drain below.
+
+#### Handover to notices: who acks, idempotency, no double delivery
+
+1. **Durable first.** Every durable server → daemon event is first written
+   to the notices queue (today's Upstash sorted set per harness, kept
+   7 days), where it gets its notice `id`. Only then is it pushed to the
+   relay as `event` with `idempotencyKey` set to that id.
+2. **Live delivery takes a lease.** When the DO hands a durable event to a
+   connected socket, the server takes a lease on that notice for the
+   delivery (default 300 s). A concurrent `notices/take` therefore can't
+   return the same notice while it is in flight.
+3. **The handler acks, over HTTPS, by id.** The plugin that handles the
+   event (normally comms, or soul-runtime for wakes) processes it, records
+   the id in its processed set, and then calls
+   `POST /api/daemon/notices/ack { ids: [<notice id>] }`. The socket-level
+   `ack` frame only clears the relay's replay buffer and is never the
+   authoritative ack.
+4. **Offline drain.** When the socket is down, notices stay queued. On
+   reconnect, and every 5 minutes while disconnected, the daemon drains with
+   `notices/take` (leasing them), processes each one, and acks. Anything it
+   fails to process is released, or comes back when the lease expires.
+5. **No double effects.** The daemon keeps a processed-id set per harness in
+   `storage`, held at least as long as notices are retained (7 days). A
+   notice seen twice, live and then by take or the other way round, is
+   acked again but not processed again. A notice that was already acked is
+   never redelivered. A stale lease reports `stale` on ack and is treated as
+   already handled.
+6. **Delivery semantics.** Delivery is at least once, with effects exactly
+   once per notice id.
+
+**Server work this needs** (PR 11 designs it, PRs 12–13 build it):
+
+- the relay Worker and DO;
+- the internal push API;
+- lease-on-live-delivery on notices;
+- a frame-signing key (the response key, with its own `kid`);
+- device policy for which RPC methods the server may call.
 
 ## 5. Soul package format, draft v3
 
@@ -486,9 +691,19 @@ The suite lives in `agent-bot-soul-runtime/conformance/` and runs as
 | 7 | Secrets canary | A declared secret resolved through the adapter appears in no export, log, audit receipt, revision or event payload. |
 | 8 | Determinism | With `clock` and `random` injected, two runs produce byte-identical stores. |
 | 9 | Refusals | A capability unavailable on a target (e.g. `computerUse` on server) gives the same code, `capability-unavailable`. A stale parent gives `revision-conflict`. |
-| 10 | Approvals | `SOUL.md`, `bin/` and capability changes always produce an approval request. Nothing is applied before the decision. |
+| 10 | Approvals (`ApprovalPort`) | `SOUL.md`, `bin/` and capability changes always produce an approval request, with the same `digest` for the same action on both runtimes. Nothing is applied before the decision. A denial gives `approval-denied`; an expired request gives `approval-expired` and changes nothing. |
+| 11 | Identity (`IdentityPort`) | `agentId` is stable across a move. `mintRepoToken(soulId, repo)` returns a token scoped to exactly that repo, and any other repo gives `scope-denied`. `coAuthorTrailer` is byte-identical. `soulToken` verifies under the published key with `aud` `agent-comms`. |
+| 12 | Comms (`CommsPort`) | A wake delivered live and the same notice drained later cause one turn, not two (idempotency by notice id). `comms: false` souls never touch the port. |
+
+Every port in §6 is covered: storage (rows 2, 3, 5, 6), secrets (7),
+exec (5, 9), comms (12), identity (11), approvals (10), and clock, random and
+log (8, 7).
 
 ## 6. Adapter interfaces for soul-runtime
+
+The core takes nine ports. Five carry the platform (storage, secrets, exec,
+comms, clock), and four connect it to the rest of the system or make it
+testable (identity, approvals, random, log).
 
 ```js
 createSoulRuntime({ storage, secrets, exec, comms, clock, random, identity, approvals, log })
@@ -516,7 +731,7 @@ createSoulRuntime({ storage, secrets, exec, comms, clock, random, identity, appr
 | --- | --- | --- |
 | macOS, Linux | HTTP/1.1 over a Unix domain socket at `<state>/daemon/ui.sock` (0700 directory, 0600 socket); WebSocket or SSE on the same socket for events | Peer UID must equal the owner UID. On macOS, optionally the audit-token code-signing requirement of the dudles app. |
 | Windows | Named pipe `\\.\pipe\agent-bot-<user SID>-ui`, DACL limited to the user SID | `GetNamedPipeClientProcessId` → SID check |
-| Browser PWA | Today's loopback `127.0.0.1` `/ui` with a pairing code and HttpOnly cookie (`agent-web.mjs`) | `Origin` plus the `x-agent-bot-ui` header |
+| Browser PWA | Today's loopback `127.0.0.1` `/ui` with a pairing code and HttpOnly cookie (`agent-web.mjs`). **This is the one exception to "no inbound listeners":** it binds `127.0.0.1` only, never `0.0.0.0` or `::`, and is off unless the owner runs `agent-bot web open`. Remote access stays an explicit operator deployment, as today. | Loopback peer check, `Origin`, and the `x-agent-bot-ui` header |
 | iOS, Android | No local daemon (background limits). dudles reaches a daemon through the **server relay** with the same request shapes, end-to-end signed by both device keys. | Relay authenticates both ends. Depends on the server relay. |
 
 ### 7.2 Authentication
@@ -537,6 +752,14 @@ createSoulRuntime({ storage, secrets, exec, comms, clock, random, identity, appr
   never approve policy itself. A local `control-local` scope may pause or
   stop a soul without the gate, which keeps today's emergency-brake
   behaviour.
+- **Domain.** The gate is moving from `agent-bot-gold.vercel.app` to
+  `agents.true-line.ai`, with the relay at `relay.true-line.ai`. Approvals
+  and passkeys are built on the final origin from the start. The WebAuthn
+  RP ID is `agents.true-line.ai`, fixed before PR 18 ships, because changing
+  an RP ID later invalidates every registered passkey. Deep links, the
+  release-pinned `server-keys.json` (§4.7) and the default
+  `settings.agentBotServer` all name the final domain. Devices enrolled
+  against the old origin move as described in risk R10.
 
 ### 7.3 Main calls (`/v2`, JSON, `schemaVersion` on every response)
 
@@ -589,12 +812,13 @@ installed hooks, GeniusBar and the Worker load modules by path.
 ## 9. Migration plan
 
 Each step is one PR with one objective, mergeable on its own and reversible.
-Steps 1–10 happen **inside agent-bot-identity** behind its existing tests,
-so nothing depends on new repos until phase 3. Each PR follows the SOP
-(issue first, PR-first, validate before push, bot-signed commits) and uses
-`Refs #N` for partial work.
+Phase 1 happens mostly **inside agent-bot-identity** behind its existing
+tests, plus the SDK in this repository and the relay design in the server
+repository, so nothing depends on new repos until phase 3. Each PR follows
+the SOP (issue first, PR-first, validate before push, bot-signed commits)
+and uses `Refs #N` for partial work.
 
-### Phase 1: prepare in place (agent-bot-identity, plus the SDK in agent-bot-daemon)
+### Phase 1: prepare in place, and design the relay
 
 | # | Repo | PR | Done when |
 | --- | --- | --- | --- |
@@ -605,38 +829,40 @@ so nothing depends on new repos until phase 3. Each PR follows the SOP
 | 5 | identity | **Target column:** `runtime-modules.json` gains `target` (`daemon`, `sdk`, `identity`, `comms`, `soul-runtime/core`, `soul-runtime/daemon-adapter`, `gate`, `deprecated`) and a test that forbids new plugin → plugin edges | Map and test merged, no runtime change |
 | 6 | daemon | **SDK v0:** `definePlugin`, host-service interfaces, `createTestHost`, the plugin conformance suite, `wire/` (binding proof, presence verifier, identity-format) | Published as a pinned, digested copy |
 | 7 | identity | **Route registry:** the `agent-daemon.mjs` request switch becomes registered routes with auth classes (generalising `createIdentityRoutes`/`createSoulRoutes`). SDK vendored. | `daemon-route-auth.test.mjs` unchanged and green |
-| 8 | identity | **MCP and CLI registries:** `agent-mcp`, `daemon-mcp` and `cli/dispatch` read registered tools and commands | Golden tests from PR 1 green |
-| 9 | identity | **Server link split:** `server-client.mjs` → daemon-side transport (`ServerSession`, verification, retry) plus identity-side enrollment and assertion signing behind a `signAssertion` port; a notices client is added | Server mode behaves the same; new unit tests |
+| 8 | identity | **MCP, CLI and RPC registries:** `agent-mcp`, `daemon-mcp` and `cli/dispatch` read registered tools and commands; `ctx.rpc.register` added | Golden tests from PR 1 green |
+| 9 | identity | **Server link split and hardening:** `server-client.mjs` → daemon-side transport (`ServerSession`, verification, retry) plus identity-side enrollment and assertion signing behind a `signAssertion` port. §4.7 rules: `kid` header, refusal of unsigned, unknown-key or skewed responses, release-pinned `server-keys.json` with TOFU only for named non-default servers. A notices client is added. | Server mode behaves the same; tests cover each refusal |
 | 10 | identity | **Notices:** MCP `take_notices`/`ack_notices`/`release_notices`/`peek_notices`; `take_inbox` becomes the compat alias when server mode is on; `doctor` reports inbox deprecation | Both paths tested; receipts unchanged |
+| 11 | server | **Relay design (§4.8):** topology (a DO per device at `relay.true-line.ai`), connect and re-auth, frame format and signing, RPC policy, MCP event delivery, reconnect, and the notices handover (lease on live delivery, ack by id over HTTPS, idempotency) | Design merged in `true-line/agent-bot`; §4.8 here matches it |
 
-### Phase 2: trust boundary (server + identity)
+### Phase 2: two-way comms and the trust boundary (server + identity)
 
 | # | Repo | PR | Done when |
 | --- | --- | --- | --- |
-| 11 | server | **Device hardening:** `key_storage=hardware` attestation check; per-device policy for read-only scope and hardware-only mint; a self-revoke endpoint (`server-mode.md` "Known limits") | Documented in `/docs/api.md` |
-| 12 | server | **Issued-token tracking:** record each installation token minted per device (hash, expiry); on device revoke, revoke its live tokens through `DELETE /installation/token` | Revoke kills live tokens within a minute |
-| 13 | identity | **Signer v1:** keyd becomes `agent-bot-signer`. Device key in Secure Enclave (macOS) or TPM (Windows NCrypt, Linux tpm2), with a separate-OS-user fallback. Protocol: `device/public-key`, `device/sign-assertion`, `device/attest`, `soul/sign-token`. | `server enroll` uses the signer; `key_storage=hardware` reported |
-| 14 | identity | **Server mode becomes the default;** local custody sits behind `legacy-local-custody`; vouch key moves into the signer; `doctor` flags any `.pem` on disk | A fresh install holds no long-lived secret on disk |
-| 15 | server | **Approvals API** (owner passkey) and **vault** (leased secrets) | Endpoints plus docs |
-| 16 | identity | **Owner gate split:** policy actions (grants, App, scope, capability) → gate approvals; local presence only for `scope: local` | Route-auth table updated; tests |
-| 17 | identity | **Retire gh-app-hook:** repoint App webhooks to the server, dual-run, then delete the Worker, `wrangler.toml` and the inbox secrets | `doctor` has no `inbox.*` checks |
-| 18 | server | **Relay/RPC channel** for daemon ↔ UI ↔ server (needed for mobile dudles and cross-machine comms) | Documented route plus `services.server.subscribe` |
+| 12 | server | **Relay build:** Worker plus a DO per device, connect, re-auth and revoke, signed frames, internal push API, lease on live delivery for notices | Relay contract tests green against staging |
+| 13 | identity | **Relay client:** `services.server.subscribe` over the relay, `resume`, backoff, heartbeat, offline drain, processed-id set, MCP event forwarding | A forced disconnect test shows no lost and no doubled notices |
+| 14 | server | **Device hardening:** `key_storage=hardware` attestation check; per-device policy for read-only scope and hardware-only mint; a self-revoke endpoint (`server-mode.md` "Known limits") | Documented in `/docs/api.md` |
+| 15 | server | **Issued-token tracking:** record each installation token minted per device (hash, expiry); on device revoke, revoke its live tokens through `DELETE /installation/token` | Revoke kills live tokens within a minute |
+| 16 | identity | **Signer v1:** keyd becomes `agent-bot-signer`. Device key in Secure Enclave (macOS) or TPM (Windows NCrypt, Linux tpm2), with a separate-OS-user fallback. Protocol: `device/public-key`, `device/sign-assertion`, `device/attest`, `soul/sign-token`. | `server enroll` uses the signer; `key_storage=hardware` reported |
+| 17 | identity | **Server mode becomes the default** (`agents.true-line.ai`); local custody sits behind `legacy-local-custody`; vouch key moves into the signer; `doctor` flags any `.pem` on disk | A fresh install holds no long-lived secret on disk |
+| 18 | server | **Approvals API** (owner passkey, RP ID `agents.true-line.ai`) and **vault** (leased secrets) | Endpoints plus docs |
+| 19 | identity | **Owner gate split:** policy actions (grants, App, scope, capability) → gate approvals; local presence only for `scope: local` | Route-auth table updated; tests |
+| 20 | identity | **Retire gh-app-hook:** repoint App webhooks to the server, dual-run, then delete the Worker, `wrangler.toml` and the inbox secrets | `doctor` has no `inbox.*` checks |
 
 ### Phase 3: split repositories
 
 | # | Repo | PR | Done when |
 | --- | --- | --- | --- |
-| 19 | daemon | **Skeleton:** host, loader, server link, local API, CLI facade, hook runner, readiness host, carried with path-filtered history (re-signed as the bot with an origin trailer, the owner's 2026-10-11 answer 1) | Runs with **zero** plugins in safe mode; CI green |
-| 20 | daemon | **`/v2` UI API** (§7) with UDS and named pipe transports | Route-auth test covers `/v2` |
-| 21 | soul-runtime | **Core plus ports** carried from soul modules; the core purity test; daemon adapters | Conformance suite green on `daemon` and `server-sim` |
-| 22 | comms | **Rename `agent-comms` → `agent-bot-comms`** (GitHub redirect; Formula and tap updated), import agent-bot's comms modules, wrap as a plugin, keep the `agent-comms` CLI | Plugin conformance green; `agent-comms` release unchanged for users |
-| 23 | identity | **Shed host, soul and comms** from agent-bot-identity, leaving the identity plugin and signer; old root paths become shims into the pinned daemon install | Plugin conformance green |
-| 24 | daemon | **First bundled release:** `governance/plugins.json` pins the three plugins; Homebrew, GeniusBar and the Linux bundle switch to the daemon artifact | Golden surface tests from PR 1 green against the release |
-| 25 | server | **soul-runtime on server:** Node function using the server adapters for unmanaged souls | Conformance `server-staging` nightly green |
+| 21 | daemon | **Skeleton:** host, loader (with load-time digest check), server link, relay client, local API, CLI facade, hook runner, readiness host, carried with path-filtered history (re-signed as the bot with an origin trailer, the owner's 2026-10-11 answer 1) | Runs with **zero** plugins in safe mode; CI green |
+| 22 | daemon | **`/v2` UI API** (§7) with UDS and named pipe transports | Route-auth test covers `/v2` |
+| 23 | soul-runtime | **Core plus ports** carried from soul modules; the core purity test; daemon adapters | Conformance suite green on `daemon` and `server-sim` |
+| 24 | comms | **Rename `agent-comms` → `agent-bot-comms`** (GitHub redirect; Formula and tap updated), import agent-bot's comms modules, wrap as a plugin, keep the `agent-comms` CLI | Plugin conformance green; `agent-comms` release unchanged for users |
+| 25 | identity | **Shed host, soul and comms** from agent-bot-identity, leaving the identity plugin and signer; old root paths become shims into the pinned daemon install | Plugin conformance green |
+| 26 | daemon | **First bundled release:** `governance/plugins.json` pins the three plugins; Homebrew, GeniusBar and the Linux bundle switch to the daemon artifact | Golden surface tests from PR 1 green against the release |
+| 27 | server | **soul-runtime on server:** Node function using the server adapters for unmanaged souls | Conformance `server-staging` nightly green |
 
 ### Phase 4: cleanup
 
-Remove the shims (two releases after step 24), remove `/v0` and `/v1` once
+Remove the shims (two releases after step 26), remove `/v0` and `/v1` once
 dudles has moved, and remove the legacy local custody and local secrets at
 1.0.
 
@@ -693,22 +919,27 @@ dudles has moved, and remove the legacy local custody and local secrets at
   plan says yes; soul-runtime runs only on the daemon or the server.
 - **Q7.** Should comms message bodies at rest be end-to-end encrypted between
   souls and principals?
-- **Q8.** The server relay and RPC aren't in the deployed API. Which repo
-  owns that design (`true-line/agent-bot`), and on what timeline?
+- **Q8 (answered in review).** The relay is gate code in
+  `true-line/agent-bot`: a Cloudflare Durable Object per device at
+  `relay.true-line.ai`. The daemon only dials out, and falls back to notices
+  when offline. The design is §4.8, with the server design in PR 11 and the
+  build in PRs 12–13. What's still open is the timeline for the server side.
 
 ### 10.3 Risks
 
 | ID | Risk | Mitigation |
 | --- | --- | --- |
 | R1 | Hub files: `agent-daemon.mjs` (2.4k lines), `readiness.mjs` (3.1k), `agent-population.mjs` (1.6k, 65 importers), `soul-runtimes.mjs` (1.5k) | Registries first (PRs 7–8), so the hubs shrink by moving registrations rather than by rewriting |
-| R2 | GitHub installation tokens are 1 h bearer tokens and can't be DPoP-bound | One repo and least permissions per mint, server-side revoke on device revoke (PR 12), optional server-side commits (Q4) |
+| R2 | GitHub installation tokens are 1 h bearer tokens and can't be DPoP-bound | One repo and least permissions per mint, server-side revoke on device revoke (PR 15), optional server-side commits (Q4) |
 | R3 | No TPM or Secure Enclave on some Linux hosts and containers | Separate-OS-user signer fallback, reported as `key_storage=software`; the server can refuse to mint for software devices per policy |
 | R4 | In-process plugins aren't isolated from each other | Accepted, because the trust boundary is the gate, not the plugin. An out-of-process plugin host can come later without changing the contract. |
 | R5 | GeniusBar, installed hooks and the Worker load modules by path | Shims for two or more releases; golden surface tests; the `RELEASE_COMMIT` and compatibility checks kept |
 | R6 | agent-bot-identity is busy (several merges a day), so long-lived branches would rot | Phase 1 is in place, one PR at a time; each repo split carries history by path filter at a single cut |
 | R7 | Windows parity (named pipes, the `comms-windows` native relay, DPAPI) | Windows CI on every plugin; the agent-comms Windows acceptance suite moves with it |
 | R8 | Re-enrollment churn when software device keys move to the signer | Dual keys during the transition: re-enroll per device, then revoke the old device on the server |
-| R9 | The local owner gate stops being authoritative before the gate approvals API exists | Order matters: PR 16 lands only after PR 15 |
+| R9 | The local owner gate stops being authoritative before the gate approvals API exists | Order matters: PR 19 lands only after PR 18 |
+| R10 | The domain move (`agent-bot-gold.vercel.app` → `agents.true-line.ai`) strands enrolled devices: `ServerSession.device()` refuses when `device.json`'s `server` differs from the configured URL, and passkeys bind to their RP ID | Before any device enrolls against the new origin, the server publishes a signed alias statement (old origin → new origin, same key set) that the daemon accepts once and uses to rewrite `device.json`. Otherwise devices run `server enroll --force`. Passkeys are registered only on `agents.true-line.ai` (§7.2). |
+| R11 | The relay is a new dependency on the server → daemon path | Notices stay the durable path and the relay only speeds it up. An outage delays events by at most the 5-minute drain interval. RPC fails fast with `device-offline`. |
 
 ---
 
