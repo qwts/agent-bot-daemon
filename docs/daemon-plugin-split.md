@@ -919,7 +919,12 @@ Chris decided these on 2026-10-27, after PR #2 merged (issue #1).
   - **Signing team:** for now the same Developer ID team that signs
     GeniusBar, `Z5DM34QS5U` (identifier `agent-bot-keyd`, confirmed with
     `codesign -dv` on 2026-10-31; hosts pin it as `settings.keydTeamId`);
-    later True-Line AI LLC's own team. The team change is a
+    later True-Line AI LLC's own team. The presence helper must ship as a
+    bundle carrying an embedded Developer ID provisioning profile that
+    grants `keychain-access-groups` (`$(AppIdentifierPrefix)<bundle-id>`),
+    because macOS requires a provisioning profile to use the
+    data-protection keychain and Secure Enclave keys under a Developer ID
+    signature. The team change is a
     planned rotation, not a silent swap: a Secure Enclave key lives in its
     team's keychain access group, so the new build makes a new presence
     key; the old key signs a statement naming the new public key; the
