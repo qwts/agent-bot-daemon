@@ -241,9 +241,10 @@ access-controlled. Remote owner administration uses a tunnel the owner opens
 | Repo | Owns | Ships |
 | --- | --- | --- |
 | **agent-bot-daemon** (HQ) | `hq/v1` control API and owner session authentication; the authoritative store; enforcement-profile detection and honest reporting (R8); member launch under protected principals; the identity-service link; the plugin host; the `agent-bot` CLI (owner commands); the member-facing surfaces (`agent-bot mcp`, `reach-mcp`, hook runner) as thin clients of HQ; readiness and doctor; install and update; the org resolver; `@agent-bot/sdk`; the WP1 contract schemas and fixtures | The HQ release: the pinned plugin set plus launchers for macOS, Windows and Linux |
-| **agent-bot-identity** | Device enrollment with the identity service; the HQ signer (keyd → `agent-bot-signer`); credential references and their resolution into short-lived tokens held by HQ; grants and caller-bound grant handles; HQ approval records; Soul ID, member, runtime and installation identity; receipts and attribution (0.4's [S5] scope); the cooperative-profile member tools (gh shim, credential helper, git hooks) | Plugin package plus the signer binary |
+| **agent-bot-identity** | Device enrollment with the identity service; the HQ signer (keyd → `agent-bot-signer`; host-side key custody moves to agent-bot-machine per D4); credential references and their resolution into short-lived tokens held by HQ; grants and caller-bound grant handles; HQ approval records; Soul ID, member, runtime and installation identity; receipts and attribution (0.4's [S5] scope); the cooperative-profile member tools (gh shim, credential helper, git hooks) | Plugin package plus the signer binary |
 | **agent-bot-comms** | Broker mode (in HQ): mailbox, durable inbox and outbox, directives and queries as message kinds, the task service, dedup in HQ's store, budgets and sub-allocations, brokered inference and service egress, receipts. Client mode (in the Soul): the CLI and early validation. Relay mode: site and cloud relays. Also the identity-service notices feed, the A2A edge gateway, and channel adapters (Telegram). | Plugin package, the `agent-comms` CLI, and the relay build |
 | **agent-bot-soul-runtime** | Package format (0.4 §11), validator, manifest digests, `soul build` render per adapter, adapter manifests, transfer, fork and template export, dream admission and candidate workflow (HQ side); the entry point: front door, member supervision, role routing, handoff notes, recovery ladder (Soul side); the pure core both use; conformance fixtures | `core/`, `hq/` (plugin), `entry-point/` (pinned with each Soul, per 0.4 §3) |
+| **agent-bot-machine** (today `qwts/managed-machine`) | The privileged executor and installer in the `admin` account (no root): signed-request verbs from agent-daemon only, receipts, catalog verification; host-side credential and policy custody, and verification of the owner's Secure Enclave presence signature for privileged requests (D4) | The executor binary, a plugin piece agent-daemon can host, and a lightweight shim for hosts without the rest of the runtime; Developer ID-signed keyd custody and presence-helper builds |
 
 ### 3.2 Trust domains, per plugin
 
@@ -874,6 +875,62 @@ Chris decided these on 2026-10-27, after PR #2 merged (issue #1).
   pure, and there is no server-runtime work before the pilot gates. Hosted
   Souls remain the plan for hosts that can't run a daemon, so nothing may be
   designed that rules them out.
+- **D4. Credentials and policy live in agent-bot-machine's `admin` sandbox;
+  owner presence is a Secure Enclave signature checked there. Accepted
+  2026-10-31.** On macOS, Homebrew and agent-bot-machine run in the `admin`
+  account, and that account is the sandbox:
+  - **Host-side credentials** (agent-machine's own keys; provider keys that
+    can't be short-lived; App keys on a host not yet in server mode) live
+    only in `admin`-owned `0600` files or `admin` keychain items. Members
+    and the owner's `user` account cannot read them. They are used only by
+    agent-machine, on agent-daemon's signed requests, and never returned:
+    agent-machine performs the operation or returns a short-lived result.
+  - **Policy** (harness → App map, server mode, feature gates, approvers)
+    is readable by the daemon and the owner and writable only by
+    agent-machine. A member that edits a copy changes nothing; the daemon
+    refuses unsigned policy, keeps the last signed version, and alerts.
+  - **Owner presence is enforced at the client and verified at the
+    sandbox.** The owner's client (the `agent-bot` CLI, the local web UI,
+    or the daemon acting for the owner) holds a non-exportable Secure
+    Enclave key with a user-presence access control, so every signature
+    needs Touch ID or the login password. Policy changes, pairing, adding
+    an App and owner-gated actions carry that signature over the exact
+    action digest, fresh and single-use. agent-machine pins the public
+    key at pairing and refuses a privileged request without a valid
+    signature, even when it is validly signed by the daemon. agent-machine
+    never shows a prompt itself.
+  - **keyd splits.** Key custody and signing move into agent-bot-machine
+    (`admin`). What stays in the owner's session is the presence prompt and
+    its Secure Enclave key, which hold nothing readable. keyd no longer
+    depends on GeniusBar, which is a GUI only: both pieces get their own
+    Developer ID-signed, notarized releases and Homebrew packages, and
+    `agent-bot keyd install` points at them.
+  - **Residual risk, stated:** while members share the owner's `user`
+    account, any process there can use the daemon's machine-client key, so
+    routine brokered operations (status, receipts, a credential-backed
+    request) are reachable by any `user` process. They never yield a raw
+    secret and are receipted with soul and session. Privileged and policy
+    operations are not reachable, because they need the presence
+    signature. Per-member or per-harness accounts (Q1) close the rest.
+  - **Repository home:** the target repositories are `true-line/*`
+    (`agent-bot-daemon`, `agent-bot-identity`, `agent-bot-soul`,
+    `agent-comms`, `agent-bot-machine`). Work lands in the current `qwts`
+    repositories and the owner transfers them.
+  - **Signing team:** for now the same Developer ID team that signs
+    GeniusBar, `Z5DM34QS5U` (identifier `agent-bot-keyd`, confirmed with
+    `codesign -dv` on 2026-10-31; hosts pin it as `settings.keydTeamId`);
+    later True-Line AI LLC's own team. The presence helper must ship as a
+    bundle carrying an embedded Developer ID provisioning profile that
+    grants `keychain-access-groups` (`$(AppIdentifierPrefix)<bundle-id>`),
+    because macOS requires a provisioning profile to use the
+    data-protection keychain and Secure Enclave keys under a Developer ID
+    signature. The team change is a
+    planned rotation, not a silent swap: a Secure Enclave key lives in its
+    team's keychain access group, so the new build makes a new presence
+    key; the old key signs a statement naming the new public key; the
+    owner approves the re-pin at agent-machine and the agent-bot signer pin
+    (`presence.signer`) changes through the owner gate. Until that
+    statement is accepted, a build from the new team is refused.
 - **`legacy-local-custody`: removed at stage 3 exit or on 2027-01-31,
   whichever comes first.** It is off by default until then. It shipped off
   by default, with the date enforced in code, in
