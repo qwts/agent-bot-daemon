@@ -917,7 +917,9 @@ Chris decided these on 2026-10-27, after PR #2 merged (issue #1).
     `agent-comms`, `agent-bot-machine`). Work lands in the current `qwts`
     repositories and the owner transfers them.
   - **Signing team:** for now the same Developer ID team that signs
-    GeniusBar; later True-Line AI LLC's own team. The team change is a
+    GeniusBar, `Z5DM34QS5U` (identifier `agent-bot-keyd`, confirmed with
+    `codesign -dv` on 2026-10-31; hosts pin it as `settings.keydTeamId`);
+    later True-Line AI LLC's own team. The team change is a
     planned rotation, not a silent swap: a Secure Enclave key lives in its
     team's keychain access group, so the new build makes a new presence
     key; the old key signs a statement naming the new public key; the
