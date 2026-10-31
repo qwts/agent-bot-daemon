@@ -916,8 +916,14 @@ Chris decided these on 2026-10-27, after PR #2 merged (issue #1).
     (`agent-bot-daemon`, `agent-bot-identity`, `agent-bot-soul`,
     `agent-comms`, `agent-bot-machine`). Work lands in the current `qwts`
     repositories and the owner transfers them.
-  - **Open:** the Developer ID team that signs keyd and the presence
-    helper.
+  - **Signing team:** for now the same Developer ID team that signs
+    GeniusBar; later True-Line AI LLC's own team. The team change is a
+    planned rotation, not a silent swap: a Secure Enclave key lives in its
+    team's keychain access group, so the new build makes a new presence
+    key; the old key signs a statement naming the new public key; the
+    owner approves the re-pin at agent-machine and the agent-bot signer pin
+    (`presence.signer`) changes through the owner gate. Until that
+    statement is accepted, a build from the new team is refused.
 - **`legacy-local-custody`: removed at stage 3 exit or on 2027-01-31,
   whichever comes first.** It is off by default until then. It shipped off
   by default, with the date enforced in code, in
